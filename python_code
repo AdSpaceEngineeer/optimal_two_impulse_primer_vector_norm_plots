@@ -1,0 +1,528 @@
+# THIS CODE OPTIMIZES A TWO-IMPULSE LAMBERT ARC TO A LAMBERT + FINAL COAST ARC FOR PRIMER VECTOR NORM TO STAY <= 1
+#import libraries
+import numpy as np
+import math
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+# LAMBERT SOLVER ------------------------------------
+def lambert_test(R1, R2, t, mu, direction='pro'):
+    R1 = np.array(R1, dtype=float)
+    R2 = np.array(R2, dtype=float)
+    r1 = np.linalg.norm(R1)
+    r2 = np.linalg.norm(R2)
+
+    cosΔθ = np.dot(R1, R2) / (r1 * r2)
+    cosΔθ = np.clip(cosΔθ, -1.0, 1.0)
+    θ = np.arccos(cosΔθ)
+
+    c12 = np.cross(R1, R2)
+    if direction == 'pro' and c12[2] < 0:
+        θ = 2*np.pi - θ
+    elif direction == 'retro' and c12[2] > 0:
+        θ = 2*np.pi - θ
+
+    A = np.sin(θ) * np.sqrt(r1 * r2 / (1 - np.cos(θ)))
+
+    def stumpC(z):
+        if z > 0:
+            return (1 - np.cos(np.sqrt(z))) / z
+        elif z < 0:
+            return (np.cosh(np.sqrt(-z)) - 1) / (-z)
+        else:
+            return 0.5
+
+    def stumpS(z):
+        if z > 0:
+            sz = np.sqrt(z)
+            return (sz - np.sin(sz)) / (sz**3)
+        elif z < 0:
+            sz = np.sqrt(-z)
+            return (np.sinh(sz) - sz) / (sz**3)
+        else:
+            return 1/6
+
+    def y(z):
+        return r1 + r2 + A*(z * stumpS(z) - 1) / np.sqrt(stumpC(z))
+
+    def F(z):
+        return (y(z)/stumpC(z))**1.5 * stumpS(z) + A * np.sqrt(y(z)) - np.sqrt(mu) * t
+
+    def dFdz(z):
+        C = stumpC(z)
+        S = stumpS(z)
+        yz = y(z)
+        if abs(z) < 1e-8:
+            return (np.sqrt(2)/40) * yz**1.5 + A/8 * (np.sqrt(yz) + A * np.sqrt(1/(2*yz)))
+        term1 = (yz/C)**1.5 * (0.5/z * (C - 1.5*S/C) + 0.75 * (S**2)/C)
+        term2 = A/8 * (3*S/C * np.sqrt(yz) + A * np.sqrt(C/yz))
+        return term1 + term2
+
+    # Start Newton iteration at z = 0
+    z = 0.0
+    tol = 1e-8
+    nmax = 5000
+    ratio = 1.0
+    n = 0
+    while abs(ratio) > tol and n < nmax:
+        Fz = F(z)
+        if np.isnan(Fz):
+            break
+        ratio = Fz / dFdz(z)
+        z -= ratio
+        n += 1
+
+    f = 1 - y(z)/r1
+    g = A * np.sqrt(y(z)/mu)
+    gdot = 1 - y(z)/r2
+
+    V1 = (R2 - f*R1) / g
+    V2 = (gdot*R2 - R1) / g
+    return V1, V2
+
+# KEPLERIAN PROPOGATOR (for both forward and backward) -----------------------------------------
+
+def twobody_dynamics(t, x, mu):
+    r3 = np.linalg.norm(x[:3])**3
+    dxdt = np.zeros(6)
+    dxdt[:3] = x[3:]
+    dxdt[3:] = -mu / r3 * x[:3]
+    return dxdt
+
+def fwd_prop_numerical(r0, v0, dt, mu):
+    x0 = np.concatenate((r0, v0))
+    t_span = [0, dt]
+    t_eval = np.linspace(t_span[0], t_span[1], 500)    
+    sol = solve_ivp(twobody_dynamics, t_span, x0, args=(mu,), t_eval=t_eval, rtol=1e-9, atol=1e-12)
+    rf = sol.y[:3, -1]
+    vf = sol.y[3:, -1]
+    return rf, vf
+
+def bwd_prop_numerical(r0, v0, dt, mu):
+    x0 = np.concatenate((r0, v0))
+    t_span = [dt, 0]
+    t_eval = np.linspace(t_span[0], t_span[1], 500)    
+    sol = solve_ivp(twobody_dynamics, t_span, x0, args=(mu,), t_eval=t_eval, rtol=1e-9, atol=1e-12)
+    rf = sol.y[:3, -1]
+    vf = sol.y[3:, -1]
+    return rf, vf
+
+
+# PRIMER VECTOR HISTORY FUNCTION ------------------------------------------------------
+
+def primer_vector_impulse(tp, Xp, tp1, Xp1, dv0, dvf):
+    """
+    Compute the primer vector history and initial/final derivatives.
+    Parameters:
+    - tp : time vector (Lambert segment)
+    - Xp : state + STM (Lambert segment), shape (N, 42)
+    - tp1 : time vector (coast segment)
+    - Xp1 : state + STM (coast segment), shape (M, 42)
+    - dv0 : first delta-V vector (3,)
+    - dvf : final delta-V vector (3,)
+    
+    Returns:
+    - pnorm     : norm of primer vector at all times
+    - p0        : initial primer vector
+    - p0_dot    : time derivative of p0
+    - p0_proj   : projection of p0_dot onto p0
+    - pf        : final primer vector
+    - pf_dot    : time derivative of pf
+    - pf_proj   : projection of pf_dot onto pf
+    """
+    # STM at end of Lambert arc (before final coast)
+    phi_tf = Xp[-1, 6:].reshape(6, 6)
+    
+    Mfo = phi_tf[0:3, 0:3]
+    Nfo = phi_tf[0:3, 3:6]
+    Sfo = phi_tf[3:6, 0:3]
+    Tfo = phi_tf[3:6, 3:6]
+    
+    # Primer vectors (unit direction of ΔV vectors)
+    p0 = dv0 / np.linalg.norm(dv0)
+    pf = dvf / np.linalg.norm(dvf)
+
+    # Time derivatives using STM
+    p0_dot = np.linalg.solve(Nfo, pf - Mfo @ p0)
+    pf_dot = Sfo @ p0 + Tfo @ p0_dot
+
+    # Projections onto primer vectors
+    p0_proj = np.dot(p0_dot, p0)
+    pf_proj = np.dot(pf_dot, pf)
+
+    # Stitch together Lambert + Coast arcs
+    XpS = np.vstack((Xp, Xp1))
+    tpS = np.concatenate((tp, tp1))
+
+    # Primer vector time history
+    p = np.zeros((3, len(tpS)))
+    pnorm = np.zeros(len(tpS))
+
+    for i in range(len(tpS)):
+        phi = XpS[i, 6:].reshape(6, 6)
+        Mto = phi[0:3, 0:3]
+        Nto = phi[0:3, 3:6]
+        p[:, i] = (Nto @ np.linalg.solve(Nfo, pf) + (Mto - Nto @ np.linalg.solve(Nfo, Mfo)) @ p0)
+        pnorm[i] = np.linalg.norm(p[:, i])
+
+    return pnorm, p0, p0_dot, p0_proj, pf, pf_dot, pf_proj
+
+# GIVEN CONDITIONS --------------------------------------------------
+
+mu = 1.0
+r1 = np.array([1.0, 0.0, 0.0])  # Spacecraft 1 initial position
+v1 = np.array([0.0, 1.0, 0.0])  # Spacecraft 1 initial velocity
+r2 = np.array([1.197953265070939, 0.902722534728072, 0.0])  # Spacecraft 2 initial position
+v2 = np.array([-0.491379908754588, 0.652083163361085, 0.0])  # Spacecraft 2 initial velocity
+rf = np.array([-1.252800996512912, -0.824917973580676, 0.0])  # Final rendezvous position
+tof = 5.654866776461628  # Time of flight (90% of departure orbit period)
+
+#test drive lambert solver
+_, vf = fwd_prop_numerical(r2, v2, tof, mu)
+r_m, v_m = bwd_prop_numerical(rf, vf, 0.3*tof, mu)
+print(r_m, v_m)
+Vdep, Varr = lambert_test(r1, r_m, 0.7*tof, mu, direction='pro')
+
+# LAMBERT ARC ONLY ------------------------------------------
+
+# 1) propagate out to rendezvous
+_, vf = fwd_prop_numerical(r2, v2, tof, mu)
+
+# 2) solve Lambert directly from r1→rf in time tof
+Vdep, Varr = lambert_test(r1, rf, tof, mu, direction='pro')
+print("Lambert Arc only Vdep, Varr:", Vdep, Varr)
+
+# 3) build STM initial conds and integrate
+PHI0    = np.eye(6).reshape(36)
+XPHI0   = np.hstack((r1, Vdep, PHI0))
+sol_lamb = solve_ivp(lambda t, y: eom_stm(t, y, mu),
+                     [0, tof],
+                     XPHI0,
+                     t_eval=np.linspace(0, tof, 500),
+                     rtol=1e-9, atol=1e-12)
+
+tp_lamb  = sol_lamb.t
+Xp_lamb  = sol_lamb.y.T  # shape (N, 42)
+r_lamb   = Xp_lamb[:, :2]
+
+# 4) cost & primer computations
+tp1_lamb    = np.empty(0)
+Xp1_lamb    = np.zeros((0, 42))
+dv0_lamb    = Vdep - v1
+dvf_lamb    = vf   - Varr
+cost_J_lam  = np.linalg.norm(dv0_lamb) + np.linalg.norm(dvf_lamb)
+
+pnorm_lamb, p0_lamb, p0_dot_lamb, p0_proj_lamb, \
+pf_lamb, pf_dot_lamb, pf_proj_lamb = primer_vector_impulse(
+    tp_lamb, Xp_lamb, tp1_lamb, Xp1_lamb, dv0_lamb, dvf_lamb)
+
+print("\nLambert Arc Only")
+print("p0_dot projection onto p0:", p0_proj_lamb)
+print("pf_dot projection onto pf:", pf_proj_lamb)
+print("Lambert Arc Only cost (deltaV):", cost_J_lam)
+print(Vdep, Varr)
+
+# Lambert Arc Only plots -----------------------------------------------
+
+# Primer norm plot
+plt.figure(figsize=(8, 4))
+plt.plot(tp_lamb, pnorm_lamb, label='Lambert Arc only |p|')
+plt.axhline(1, color='gray', linestyle='--', label='Optimality Boundary')
+plt.xlabel('Time [TU]')
+plt.ylabel('|p(t)|')
+plt.title('Lambert Arc only Primer Vector Norm')
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# State trajectories
+# SC1 (initial orbit)
+PHI0 = np.eye(6).reshape(36)
+XPHI0 = np.hstack((r1, v1, PHI0))
+sol_sc1 = solve_ivp(lambda t, y: eom_stm(t, y, mu),
+                    [0, tof],
+                    XPHI0,
+                    t_eval=np.linspace(0, tof, 500),
+                    rtol=1e-9, atol=1e-12)
+tp_sc1 = sol_sc1.t
+Xp_sc1 = sol_sc1.y.T
+r_sc1  = Xp_sc1[:, :2]
+
+# SC2 (target orbit)
+PHI0 = np.eye(6).reshape(36)
+XPHI0 = np.hstack((r2, v2, PHI0))
+sol_sc2 = solve_ivp(lambda t, y: eom_stm(t, y, mu),
+                    [0, tof],
+                    XPHI0,
+                    t_eval=np.linspace(0, tof, 500),
+                    rtol=1e-9, atol=1e-12)
+tp_sc2 = sol_sc2.t
+Xp_sc2 = sol_sc2.y.T
+r_sc2  = Xp_sc2[:, :2]
+
+plt.figure(figsize=(10, 10))
+plt.plot(r_lamb[:,0], r_lamb[:,1],   color='red',       label='Lambert Arc')
+plt.plot(r_sc1[:,0], r_sc1[:,1],     color='darkorange', linestyle='--', label='SC1 Orbit')
+plt.plot(r_sc2[:,0], r_sc2[:,1],     color='blue',        linestyle='--', label='SC2 Orbit')
+plt.scatter(0, 0, color='black', s=50, marker='o', label='Central Body')
+plt.legend()
+plt.title("Lambert Arc from SC1 to SC2 Circular Orbits")
+plt.xlabel('X [AU]')
+plt.ylabel('Y [AU]')
+plt.axis('equal')
+plt.grid(True)
+plt.show()
+
+
+# NUMERICAL METHOD TO GET OPTIMAL TRAJECTORY UNTIL pf_proj -> 0   ---------------------------------------------
+
+PHI0        = np.eye(6).reshape(36)
+pf_proj     = -np.inf
+primer_time_list = []
+primer_norm_list = []
+primer_time_list.append(tp_lamb)
+primer_norm_list.append(pnorm_lamb)
+
+#pnorm_list  = []
+t_lam_i     = 0.8 * tof   # initial Lambert arc time guess
+
+while pf_proj < 0:
+    # remaining coast time
+    t_co     = tof - t_lam_i
+
+    # backward‐propagate from rf, vf to find the intermediate state at t_co before rendezvous
+    r_m, v_m = bwd_prop_numerical(rf, vf, t_co, mu)
+
+    # solve Lambert from r1 → r_m in time t_lam_i
+    V_dep, V_arr = lambert_test(r1, r_m, t_lam_i, mu, direction='pro')
+    print("check for NaN:", V_dep, V_arr)
+
+    # integrate the first impulsive arc + STM
+    PHI0   = np.eye(6).reshape(36)
+    XPHI0  = np.hstack((r1, V_dep, PHI0))
+    sol    = solve_ivp(lambda t, y: eom_stm(t, y, mu),
+                       [0, t_lam_i],
+                       XPHI0,
+                       t_eval=np.linspace(0, t_lam_i, 500),
+                       rtol=1e-9, atol=1e-12)
+    tp, Xp = sol.t, sol.y.T
+
+    # integrate the coast arc + STM
+    PHI0   = np.eye(6).reshape(36)
+    XPHI0  = np.hstack((r_m, v_m, PHI0))
+    sol1   = solve_ivp(lambda t, y: eom_stm(t, y, mu),
+                       [0, t_co],
+                       XPHI0,
+                       t_eval=np.linspace(0, t_co, 500),
+                       rtol=1e-9, atol=1e-12)
+    tp1, Xp1 = sol1.t, sol1.y.T
+
+    # compute ∆V cost
+    dv0       = V_dep - v1
+    dvf       = v_m   - V_arr
+    cost_J_opt = np.linalg.norm(dv0) + np.linalg.norm(dvf)
+    print("new cost J (deltaV):", cost_J_opt)
+
+    # primer vector
+    pnorm, p0, p0_dot, p0_proj, pf, pf_dot, pf_proj = \
+        primer_vector_impulse(tp, Xp, tp1, Xp1, dv0, dvf)
+    print("pf_proj:", pf_proj)
+
+    time_i = np.concatenate((tp, t_lam_i + tp1))
+    primer_time_list.append(time_i)
+    primer_norm_list.append(pnorm)
+    #pnorm_list.append(pnorm)
+
+    # update Lambert flight time (e.g. reduce by 10% each iteration)
+    t_lam_i *= 0.999
+
+
+# PLOTTING LAMBERT TO SUB-OPTIMAL TO OPTIMIZED ARC ----------------------
+plt.figure(figsize=(8, 6))
+
+# 0: pure‐Lambert arc
+t0 = primer_time_list[0]
+y0 = primer_norm_list[0]
+plt.plot(t0, y0, label='Lambert Arc only', color='purple')
+
+# 1: first sub-optimal trial (iteration 1)
+t1 = primer_time_list[1]
+y1 = primer_norm_list[1]
+plt.plot(t1, y1, label='Sub-optimal Lam+Coast (iter 1)', color='green')
+
+# 40: a mid-trial (if ≥41 iterations)
+if len(primer_time_list) > 40:
+    t40 = primer_time_list[40]
+    y40 = primer_norm_list[40]
+    plt.plot(t40, y40, label='Sub-optimal Lam+Coast (iter 40)', color='darkorange')
+
+# final optimal
+t_final = primer_time_list[-1]
+y_final = primer_norm_list[-1]
+plt.plot(t_final, y_final, label='Optimal Lam+Coast', color='red')
+
+# styling
+plt.axhline(1, color='gray', linestyle='--', label='Optimality Boundary')
+plt.xlabel('Time [TU]')
+plt.ylabel('|p(t)|')
+plt.title('Primer Vector Norm: from Lambert-Only to Optimal Lambert + Final Coast')
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print("\nOptimal Lambert + Coast Arc cost (ΔV):", cost_J_opt)
+
+# PLOT OF LAMBERT ARC, SUB-OPTIMAL ARCS AND OPTIMIZED ARC
+
+# pre‐allocate
+PHI0              = np.eye(6).reshape(36)
+pf_proj           = -np.inf
+primer_time_list  = []
+primer_norm_list  = []
+primer_time_list.append(tp_lamb)
+primer_norm_list.append(pnorm_lamb)
+
+r_arc_dict    = {}
+cost_dict     = {}
+stats_dict    = {}
+r_point_dict  = {}
+
+t_lam_i = 0.8 * tof   # initial Lambert arc TOF
+itr     = 0
+
+while pf_proj < 0:
+    itr += 1
+    t_co = tof - t_lam_i
+
+    # backward propagate
+    r_m, v_m = bwd_prop_numerical(rf, vf, t_co, mu)
+
+    # Lambert impulse
+    V_dep, V_arr = lambert_test(r1, r_m, t_lam_i, mu, direction='pro')
+
+    # integrate Lambert arc + STM
+    X0     = np.hstack((r1, V_dep, PHI0))
+    sol    = solve_ivp(lambda t, y: eom_stm(t, y, mu),
+                       [0, t_lam_i], X0,
+                       t_eval=np.linspace(0, t_lam_i, 500),
+                       rtol=1e-9, atol=1e-12)
+    tp, Xp = sol.t, sol.y.T
+    r_arc  = Xp[:, :2]
+
+    # integrate coast arc + STM
+    X0c    = np.hstack((r_m, v_m, PHI0))
+    sol1   = solve_ivp(lambda t, y: eom_stm(t, y, mu),
+                       [0, t_co], X0c,
+                       t_eval=np.linspace(0, t_co, 500),
+                       rtol=1e-9, atol=1e-12)
+    tp1, Xp1 = sol1.t, sol1.y.T
+
+    # ΔV cost
+    dv0        = V_dep - v1
+    dvf        = v_m   - V_arr
+    cost_J_opt = np.linalg.norm(dv0) + np.linalg.norm(dvf)
+
+    # primer
+    pnorm, p0, p0_dot, p0_proj, pf, pf_dot, pf_proj = \
+        primer_vector_impulse(tp, Xp, tp1, Xp1, dv0, dvf)
+
+    # record time-base & norm
+    time_i = np.concatenate((tp, t_lam_i + tp1))
+    primer_time_list.append(time_i)
+    primer_norm_list.append(pnorm)
+
+    # if this is itr 1 or 40, stash data
+    if itr in (1, 40):
+        label = f'iter{itr}'
+        r_arc_dict[label]   = r_arc
+        cost_dict[label]    = cost_J_opt
+        stats_dict[label]   = dict(
+            t_lam    = t_lam_i,
+            p0_dot   = p0_dot,
+            p0_proj  = p0_proj,
+            pf_dot   = pf_dot,
+            pf_proj  = pf_proj
+        )
+        r_point_dict[label] = r_m[:2]
+
+    # step TOF small amount
+    t_lam_i *= 0.999
+
+# after loop, final iteration
+r_arc_dict['final'] = r_arc
+cost_dict['final']  = cost_J_opt
+stats_dict['final'] = dict(
+    t_lam    = t_lam_i,
+    p0_dot   = p0_dot,
+    p0_proj  = p0_proj,
+    pf_dot   = pf_dot,
+    pf_proj  = pf_proj
+)
+r_point_dict['final'] = r_m[:2]
+
+# also store the “pure‐Lambert‐only” arc under label 'lambert_only'
+r_arc_dict['lambert_only']  = r_lamb
+cost_dict['lambert_only']   = None
+stats_dict['lambert_only']  = dict(
+    t_lam    = tof,
+    p0_dot   = p0_dot_lamb,
+    p0_proj  = p0_proj_lamb,
+    pf_dot   = pf_dot_lamb,
+    pf_proj  = pf_proj_lamb
+)
+r_point_dict['lambert_only'] = r_lamb[-1]
+
+
+# ANNEX 2 — Updated plotting of arcs + summary stats
+
+plt.figure(figsize=(10, 10))
+# plot SC1 and SC2 orbits
+plt.plot(r_sc1[:,0], r_sc1[:,1], color='darkorange', linestyle='--', label='SC1 Orbit')
+plt.plot(r_sc2[:,0], r_sc2[:,1], color='blue',       linestyle='--', label='SC2 Orbit')
+plt.scatter(0, 0, color='black', s=50, marker='o', label='Central Body')
+
+# define colors & labels
+plot_info = [
+    ('lambert_only', 'purple',     'Lambert Arc Only'),
+    ('iter1',       'green',       'Lambert+Coast itr 1'),
+    ('iter40',      'darkorange',  'Lambert+Coast itr 40'),
+    ('final',       'red',         'Lambert+Coast Optimal')
+]
+
+for key, color, label in plot_info:
+    if key in r_arc_dict:
+        arc = r_arc_dict[key]
+        plt.plot(arc[:,0], arc[:,1], color=color, label=label)
+        if key in r_point_dict:
+            xm, ym = r_point_dict[key]
+            plt.scatter(xm, ym,
+                        marker='x',
+                        color=color,
+                        s=100)  # no label to avoid duplicates
+
+plt.axis('equal')
+plt.title("Comparison of Transfer Arcs")
+plt.xlabel('X [AU]')
+plt.ylabel('Y [AU]')
+plt.grid(True)
+plt.legend()
+plt.show()
+
+# Print summary table
+print("\nSummary of key iterations:\n")
+for key in ('lambert_only', 'iter1', 'iter40', 'final'):
+    if key not in stats_dict:
+        continue
+    stats = stats_dict[key]
+    cost  = cost_dict.get(key, np.nan)
+    print(f"--- {key} ---")
+    print(f"  t_lam_i = {stats['t_lam']:.6f}")
+    print(f"  p0_dot  = {stats['p0_dot']}")
+    print(f"  p0_proj = {stats['p0_proj']}")
+    print(f"  pf_dot  = {stats['pf_dot']}")
+    print(f"  pf_proj = {stats['pf_proj']}")
+    if cost is not None:
+        print(f"  ΔV cost = {cost:.6f}")
+    print()
