@@ -204,7 +204,13 @@ def primer_vector_impulse(tp, Xp, tp1, Xp1, dv0, dvf):
     pnorm = np.zeros(len(tpS))
 
     for i in range(len(tpS)):
-        phi = XpS[i, 6:].reshape(6, 6)
+        if i < len(tp):
+            # Lambert segment: use STM directly
+            phi = XpS[i, 6:].reshape(6, 6)
+        else:
+            # Coast segment: compose STM with Lambert's final STM
+            phi_coast = XpS[i, 6:].reshape(6, 6)
+            phi = phi_coast @ phi_tf  # Correct composition of STM
         Mto = phi[0:3, 0:3]
         Nto = phi[0:3, 3:6]
         p[:, i] = (Nto @ np.linalg.solve(Nfo, pf) + (Mto - Nto @ np.linalg.solve(Nfo, Mfo)) @ p0)
