@@ -1,0 +1,210 @@
+# ——————————————————————————————————————————————————————
+# Compute and print p0_proj, pf_proj, Lambert time, and ΔV cost
+
+def compute_metrics(t_lam_i):
+    t_co = tof - t_lam_i
+    _, vf_arr = fwd_prop_numerical(r2, v2, tof, mu)
+    if t_co == 0:
+        r_m, v_m = rf, vf_arr
+    else:
+        r_m, v_m = bwd_prop_numerical(rf, vf_arr, t_co, mu)
+
+    V_dep, V_arr = lambert_test(r1, r_m, t_lam_i, mu, direction='pro')
+    PHI0 = np.eye(6).reshape(36)
+
+    solL = solve_ivp(lambda t,y: eom_stm(t,y,mu),
+                     [0, t_lam_i], np.hstack((r1, V_dep, PHI0)),
+                     t_eval=np.linspace(0, t_lam_i, 500), rtol=1e-9, atol=1e-12)
+    tp,  Xp = solL.t, solL.y.T
+
+    if t_co == 0:
+        tp1, Xp1 = np.array([]), np.zeros((0,42))
+    else:
+        solC = solve_ivp(lambda t,y: eom_stm(t,y,mu),
+                         [0, t_co], np.hstack((r_m, v_m, PHI0)),
+                         t_eval=np.linspace(0, t_co, 500), rtol=1e-9, atol=1e-12)
+        tp1, Xp1 = solC.t, solC.y.T
+
+    dv0  = V_dep - v1
+    dvf  = v_m   - V_arr
+    cost = np.linalg.norm(dv0) + np.linalg.norm(dvf)
+
+    _, _, _, p0_proj, _, _, pf_proj = primer_vector_impulse(tp, Xp, tp1, Xp1, dv0, dvf)
+    return p0_proj, pf_proj, t_lam_i, cost
+
+cases = [
+    ('Full Lambert',  tof),
+    ('0.8·TOF split', 0.8*tof),
+    ('Optimal split', t_lam_opt)
+]
+
+print(f"{'Case':<20} {'p0_proj':>12} {'pf_proj':>12} {'t_Lambert':>12} {'ΔV cost':>10}")
+print("-"*70)
+for label, tlam in cases:
+    p0p, pfp, tlam, cost = compute_metrics(tlam)
+    print(f"{label:<20} {p0p:12.4e} {pfp:12.4e} {tlam:12.4f} {cost:10.4f}")
+
+# Plot all three Lambert-only legs and mark their endpoints
+
+# Function to get just the Lambert leg trajectory (no coast)
+def get_lambert_leg(t_lam_i):
+    # backward‐prop from rf,vf to find intermediate rendezvous state
+    _, vf_arr = fwd_prop_numerical(r2, v2, tof, mu)
+    r_m, _    = bwd_prop_numerical(rf, vf_arr, tof - t_lam_i, mu)
+    # solve Lambert from r1→r_m in t_lam_i
+    V_dep, _ = lambert_test(r1, r_m, t_lam_i, mu, direction='pro')
+    X0 = np.hstack((r1, V_dep, np.eye(6).reshape(36)))
+    solL = solve_ivp(lambda t,y: eom_stm(t,y,mu),
+                     [0, t_lam_i], X0,
+                     t_eval=np.linspace(0, t_lam_i, 500),
+                     rtol=1e-9, atol=1e-12)
+    # extract only x,y
+    return solL.y[:2, :].T  # shape (N,2)
+
+# full direct Lambert
+traj_full = r_lamb
+
+# 0.8*tof Lambert-only
+traj_80   = get_lambert_leg(0.8 * tof)
+
+# optimal split Lambert-only
+traj_opt  = get_lambert_leg(t_lam_opt)
+
+plt.figure(figsize=(8,8))
+# full Lambert
+plt.plot(traj_full[:,0], traj_full[:,1], label='Lambert Only', linewidth=2)
+# 0.8*tof leg
+plt.plot(traj_80[:,0],  traj_80[:,1],  '--', label='0.8xTOF Lambert', linewidth=2)
+# optimal leg
+plt.plot(traj_opt[:,0], traj_opt[:,1], '-.', label='Optimal Lambert + Final Coast', linewidth=2)
+
+# mark endpoints with X
+plt.scatter(traj_full[-1,0], traj_full[-1,1], marker='X', s=200, color='red')
+plt.scatter(traj_80[-1,0],  traj_80[-1,1],  marker='X', s=200, color='C1')
+plt.scatter(traj_opt[-1,0], traj_opt[-1,1], marker='X', s=200, color='C2')
+
+# add circular orbits for context
+plt.plot(r_sc1[:,0], r_sc1[:,1], ':', color='gray', label='SC1 orbit')
+plt.plot(r_sc2[:,0], r_sc2[:,1], ':', color='gray', label='SC2 orbit')
+
+plt.scatter(0,0, color='k', s=50, marker='o', label='Central body')
+plt.axis('equal')
+plt.xlabel('X [AU]')
+plt.ylabel('Y [AU]')
+plt.title('Lambert-only to Optimal Lambert + Final Coast Arcs')
+plt.grid(True)
+plt.legend(loc='lower right')
+plt.show()
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+# function to compute primer-vector norm history for a given split time
+def compute_primer_history(t_lam_i):
+    t_co = tof - t_lam_i
+
+    # propagate forward to get arrival velocity at rf
+    _, vf_arrival = fwd_prop_numerical(r2, v2, tof, mu)
+    # backward‐propagate coast to intermediate rendezvous state
+    r_m, v_m = bwd_prop_numerical(rf, vf_arrival, t_co, mu)
+
+    # Lambert arc impulse
+    V_dep, V_arr = lambert_test(r1, r_m, t_lam_i, mu, direction='pro')
+    PHI0 = np.eye(6).reshape(36)
+    X0   = np.hstack((r1, V_dep, PHI0))
+    solL = solve_ivp(lambda t,y: eom_stm(t,y,mu),
+                     [0, t_lam_i], X0,
+                     t_eval=np.linspace(0, t_lam_i, 500),
+                     rtol=1e-9, atol=1e-12)
+    tp,  Xp  = solL.t,  solL.y.T
+
+    # coast arc STM
+    PHI0 = np.eye(6).reshape(36)
+    X1   = np.hstack((r_m, v_m, PHI0))
+    solC = solve_ivp(lambda t,y: eom_stm(t,y,mu),
+                     [0, t_co],   X1,
+                     t_eval=np.linspace(0, t_co, 500),
+                     rtol=1e-9, atol=1e-12)
+    tp1, Xp1 = solC.t, solC.y.T
+
+    # delta-V vectors
+    dv0 = V_dep - v1
+    dvf = v_m   - V_arr
+
+    # primer vector norm history
+    pnorm, *_ = primer_vector_impulse(tp, Xp, tp1, Xp1, dv0, dvf)
+
+    # stitch time vectors: coast times are offset by t_lam_i
+    t_all = np.concatenate((tp, t_lam_i + tp1))
+    return t_all, pnorm
+
+# full Lambert-only (no coast)
+t_full = tp_lamb
+p_full = pnorm_lamb
+
+# 0.8*tof + coast
+t_80, p_80 = compute_primer_history(0.8 * tof)
+
+# optimal split + coast
+t_opt, p_opt = compute_primer_history(t_lam_opt)
+
+# Plot
+plt.figure(figsize=(8,4))
+plt.plot(t_full, p_full,    label='Lambert Only', color = 'blue')
+plt.plot(t_80,   p_80,  '--', label='0.8xTOF Lambert + Coast', color = 'green')
+plt.plot(t_opt,  p_opt, '-', label='Optimal Lambert + Coast', color = 'red')
+plt.axhline(1, color='gray', linestyle=':', label='|p| = 1')
+
+plt.xlabel('Time [TU]')
+plt.ylabel('|p(t)|')
+plt.title('Primer Vector Norm Histories')
+plt.grid(True)
+plt.legend(loc='upper right')
+plt.tight_layout()
+plt.show()
+
+# Compute and print p0_proj, pf_proj, Lambert time, and ΔV cost
+
+def compute_metrics(t_lam_i):
+    t_co = tof - t_lam_i
+    _, vf_arr = fwd_prop_numerical(r2, v2, tof, mu)
+    if t_co == 0:
+        r_m, v_m = rf, vf_arr
+    else:
+        r_m, v_m = bwd_prop_numerical(rf, vf_arr, t_co, mu)
+
+    V_dep, V_arr = lambert_test(r1, r_m, t_lam_i, mu, direction='pro')
+    PHI0 = np.eye(6).reshape(36)
+
+    solL = solve_ivp(lambda t,y: eom_stm(t,y,mu),
+                     [0, t_lam_i], np.hstack((r1, V_dep, PHI0)),
+                     t_eval=np.linspace(0, t_lam_i, 500), rtol=1e-9, atol=1e-12)
+    tp,  Xp = solL.t, solL.y.T
+
+    if t_co == 0:
+        tp1, Xp1 = np.array([]), np.zeros((0,42))
+    else:
+        solC = solve_ivp(lambda t,y: eom_stm(t,y,mu),
+                         [0, t_co], np.hstack((r_m, v_m, PHI0)),
+                         t_eval=np.linspace(0, t_co, 500), rtol=1e-9, atol=1e-12)
+        tp1, Xp1 = solC.t, solC.y.T
+
+    dv0  = V_dep - v1
+    dvf  = v_m   - V_arr
+    cost = np.linalg.norm(dv0) + np.linalg.norm(dvf)
+
+    _, _, _, p0_proj, _, _, pf_proj = primer_vector_impulse(tp, Xp, tp1, Xp1, dv0, dvf)
+    return p0_proj, pf_proj, t_lam_i, cost
+
+cases = [
+    ('Full Lambert',  tof),
+    ('0.8·TOF split', 0.8*tof),
+    ('Optimal split', t_lam_opt)
+]
+
+print(f"{'Case':<20} {'p0_proj':>12} {'pf_proj':>12} {'t_Lambert':>12} {'ΔV cost':>10}")
+print("-"*70)
+for label, tlam in cases:
+    p0p, pfp, tlam, cost = compute_metrics(tlam)
+    print(f"{label:<20} {p0p:12.4e} {pfp:12.4e} {tlam:12.4f} {cost:10.4f}")
